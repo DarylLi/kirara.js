@@ -1,0 +1,10 @@
+[package]
+name = "kirara-core"
+version = "0.1.0"
+edition = "2021"
+description = "kirara.js - pure Rust rigid body physics core (v1 scope)"
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]

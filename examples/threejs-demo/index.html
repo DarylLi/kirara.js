@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>kirara.js v1 demo — Rust/WASM physics + three.js</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; }
+  #info { position: absolute; top: 10px; left: 10px; color: #ccc; font-family: monospace; font-size: 13px; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="info">kirara.js v1 — Rust/WASM 刚体物理 + three.js WebGL 渲染<br>球体/箱子从空中落下,落在地面上</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.164.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+// 编译产物:运行 `wasm-pack build --target web` 后生成在 /crates/kirara-wasm/pkg/
+// 见仓库根目录 README.md 的构建步骤。
+
+async function main() {
+  const wasmModule = await import("/crates/kirara-wasm/pkg/kirara_wasm.js");
+  const init = wasmModule.default;
+  const { KiraraWorld } = wasmModule;
+  await init();
+
+  // ---------- three.js 场景 ----------
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111111);
+  const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+  camera.position.set(6, 6, 10);
+  camera.lookAt(0, 1, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(5, 10, 5);
+  scene.add(dir);
+
+  const groundMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(20, 20),
+    new THREE.MeshStandardMaterial({ color: 0x2b2b2b })
+  );
+  groundMesh.rotation.x = -Math.PI / 2;
+  scene.add(groundMesh);
+
+  // ---------- kirara.js 物理世界 ----------
+  const world = new KiraraWorld();
+  world.add_ground_plane(0, 1, 0, 0); // 法线朝上,过原点
+
+  const meshes = [];
+  const colors = [0xff6b4a, 0x4a9eff, 0xffd24a, 0x4aff8f, 0xd24aff];
+
+  function spawnSphere(x, y, z) {
+    const radius = 0.4 + Math.random() * 0.3;
+    world.add_sphere(radius, x, y, z, radius * radius * radius * 4.0);
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(radius, 24, 16),
+      new THREE.MeshStandardMaterial({ color: colors[meshes.length % colors.length] })
+    );
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+
+  function spawnBox(x, y, z) {
+    const s = 0.5 + Math.random() * 0.4;
+    world.add_box(s / 2, s / 2, s / 2, x, y, z, s * s * s * 5.0);
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(s, s, s),
+      new THREE.MeshStandardMaterial({ color: colors[meshes.length % colors.length] })
+    );
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+
+  // 生成一批下落的球和箱子(v1 demo:box 之间不互相碰撞,见 ROADMAP)
+  for (let i = 0; i < 12; i++) {
+    const x = (Math.random() - 0.5) * 4;
+    const z = (Math.random() - 0.5) * 4;
+    const y = 4 + i * 1.2;
+    if (i % 2 === 0) spawnSphere(x, y, z); else spawnBox(x, y, z);
+  }
+
+  // ---------- 主循环 ----------
+  const FIXED_DT = 1 / 60;
+  let lastTime = performance.now();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const now = performance.now();
+    const dt = Math.min((now - lastTime) / 1000, 0.05);
+    lastTime = now;
+
+    world.step(FIXED_DT);
+
+    const t = world.get_transforms(); // Float32Array: [x,y,z,qx,qy,qz,qw] * N
+    // 第 0 个刚体是静态地面平面,渲染从索引 1(即数组偏移 7)开始对应 meshes[0]
+    for (let i = 0; i < meshes.length; i++) {
+      const o = (i + 1) * 7;
+      meshes[i].position.set(t[o], t[o + 1], t[o + 2]);
+      meshes[i].quaternion.set(t[o + 3], t[o + 4], t[o + 5], t[o + 6]);
+    }
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+}
+
+main().catch((e) => {
+  document.getElementById("info").innerHTML +=
+    `<br><span style="color:#f66">加载失败: ${e}<br>请先运行 wasm-pack build(见 README.md)</span>`;
+  console.error(e);
+});
+</script>
+</body>
+</html>
