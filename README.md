@@ -1,6 +1,6 @@
 # kirara.js
 
-<img width="1010" height="611" alt="企业微信截图_99aca811-8055-4bc7-a80a-967582de1a72" src="https://github.com/user-attachments/assets/724a0c82-7deb-4347-9eff-f06764e6da0d" />
+https://github.com/user-attachments/assets/226a0d62-9ec6-497f-ac74-465793cdd73d
 
 一个面向 Web 的 Rust → WASM 刚体物理项目。
 v1 范围:纯 Rust 刚体物理内核(`kirara-core`)+ wasm-bindgen 绑定(`kirara-wasm`)+ three.js 演示。
