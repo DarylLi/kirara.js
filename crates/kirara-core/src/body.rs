@@ -1,6 +1,10 @@
 use crate::math::{Vec3, Quat, Mat3, Transform};
 use crate::shape::Shape;
 
+const SLEEP_LINEAR_THRESHOLD: f32 = 0.05;
+const SLEEP_ANGULAR_THRESHOLD: f32 = 0.05;
+const SLEEP_FRAMES: u32 = 60;
+
 /// 单个刚体。
 /// v1 先把常用字段全部展平、公开,方便直接读写与测试。
 pub struct RigidBody {
@@ -17,6 +21,9 @@ pub struct RigidBody {
 
     /// 静态/运动学物体:inv_mass = 0,不参与积分,但参与碰撞
     pub is_static: bool,
+    pub is_sleeping: bool,
+    pub sleep_counter: u32,
+    pub integrated_last_step: bool,
 
     force_accum: Vec3,
 }
@@ -39,6 +46,9 @@ impl RigidBody {
             restitution: 0.3,
             friction: 0.5,
             is_static: false,
+            is_sleeping: false,
+            sleep_counter: 0,
+            integrated_last_step: false,
             force_accum: Vec3::ZERO,
         }
     }
@@ -54,12 +64,30 @@ impl RigidBody {
             restitution: 0.3,
             friction: 0.5,
             is_static: true,
+            is_sleeping: false,
+            sleep_counter: 0,
+            integrated_last_step: false,
             force_accum: Vec3::ZERO,
         }
     }
 
     pub fn apply_force(&mut self, f: Vec3) {
+        if f.length_sq() > 0.0 {
+            self.wake_up();
+        }
         self.force_accum = self.force_accum + f;
+    }
+
+    pub fn wake_up(&mut self) {
+        if self.is_static {
+            return;
+        }
+        self.is_sleeping = false;
+        self.sleep_counter = 0;
+    }
+
+    pub fn begin_step(&mut self) {
+        self.integrated_last_step = false;
     }
 
     /// 世界坐标系下的逆惯性张量: R * I_local^-1 * R^T
@@ -78,10 +106,33 @@ impl RigidBody {
             self.force_accum = Vec3::ZERO;
             return;
         }
+        if self.is_sleeping {
+            self.force_accum = Vec3::ZERO;
+            return;
+        }
         let accel = gravity + self.force_accum.scale(self.inv_mass);
         self.linear_velocity = self.linear_velocity + accel.scale(dt);
         self.transform.position = self.transform.position + self.linear_velocity.scale(dt);
         self.transform.rotation = self.transform.rotation.integrate(self.angular_velocity, dt);
+        self.integrated_last_step = true;
         self.force_accum = Vec3::ZERO;
+    }
+
+    pub fn update_sleep_state(&mut self) {
+        if self.is_static {
+            return;
+        }
+        let linear_slow = self.linear_velocity.length() < SLEEP_LINEAR_THRESHOLD;
+        let angular_slow = self.angular_velocity.length() < SLEEP_ANGULAR_THRESHOLD;
+        if linear_slow && angular_slow {
+            self.sleep_counter += 1;
+            if self.sleep_counter >= SLEEP_FRAMES {
+                self.is_sleeping = true;
+                self.linear_velocity = Vec3::ZERO;
+                self.angular_velocity = Vec3::ZERO;
+            }
+        } else {
+            self.wake_up();
+        }
     }
 }

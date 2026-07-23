@@ -88,12 +88,18 @@ fn effective_mass_along(bodies: &[RigidBody], a: usize, b: usize, ra: Vec3, rb: 
 /// a、b 是分开两次索引 bodies(而非同时可变借用),因此不需要 split_at_mut。
 fn apply_impulse(bodies: &mut [RigidBody], a: usize, b: usize, ra: Vec3, rb: Vec3, impulse: Vec3) {
     if !bodies[a].is_static {
+        if impulse.length_sq() > 0.0 {
+            bodies[a].wake_up();
+        }
         let inv_mass_a = bodies[a].inv_mass;
         let inv_inertia_a = bodies[a].inv_inertia_world();
         bodies[a].linear_velocity = bodies[a].linear_velocity - impulse.scale(inv_mass_a);
         bodies[a].angular_velocity = bodies[a].angular_velocity - inv_inertia_a.mul_vec3(ra.cross(impulse));
     }
     if !bodies[b].is_static {
+        if impulse.length_sq() > 0.0 {
+            bodies[b].wake_up();
+        }
         let inv_mass_b = bodies[b].inv_mass;
         let inv_inertia_b = bodies[b].inv_inertia_world();
         bodies[b].linear_velocity = bodies[b].linear_velocity + impulse.scale(inv_mass_b);
