@@ -19,6 +19,7 @@ function resolveRequestPath(urlPath) {
   let relativePath;
   if (urlPath === "/") {
     relativePath = "examples/threejs-demo/index.html";
+    // relativePath = "dist/index.html";
   } else {
     relativePath = decodeURIComponent(urlPath.slice(1));
     if (relativePath.endsWith("/")) {
@@ -70,10 +71,7 @@ function startServer(currentPort) {
     })
     .listen(currentPort, () => {
       console.log(`server start at http://localhost:${currentPort}`);
-      console.log(
-        "default demo:",
-        `http://localhost:${currentPort}/examples/threejs-demo/`,
-      );
+      console.log("default demo:", `http://localhost:${currentPort}/dist/`);
     });
 }
 

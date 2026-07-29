@@ -10,13 +10,20 @@ pub mod constraint;
 pub mod gjk;
 pub mod solver;
 pub mod world;
+pub mod character;
+pub mod vehicle;
+pub mod softbody;
 
 pub use body::RigidBody;
+pub use character::{CharacterController, CharacterState};
 pub use constraint::{AxisLock, Constraint, Generic6DofConstraint, HingeConstraint, Point2PointConstraint, SliderConstraint};
+pub use vehicle::{RaycastVehicle, Wheel};
+
+pub use softbody::{SoftBody, SpringKind, Triangle};
 pub use gjk::{gjk_closest_points, GjkResult};
 pub use math::{Vec3, Quat, Transform};
 pub use shape::{CompoundChild, MeshTriangle, Shape};
-pub use world::{RaycastHit, World};
+pub use world::{RaycastHit, SweepHit, World};
 
 #[cfg(test)]
 mod tests {
@@ -651,7 +658,7 @@ mod tests {
         ));
 
         let hit = world
-            .raycast(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0)
+            .raycast(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0, None)
             .expect("ray should hit the sphere");
 
         assert_eq!(hit.body, sphere);
@@ -853,7 +860,7 @@ mod tests {
         ));
 
         let hit = world
-            .raycast(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0)
+            .raycast(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0, None)
             .expect("ray should hit the compound child");
 
         assert_eq!(hit.body, body);
@@ -963,13 +970,668 @@ mod tests {
         ));
 
         let hit = world
-            .raycast(Vec3::new(0.0, 3.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 10.0)
+            .raycast(Vec3::new(0.0, 3.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 10.0, None)
             .expect("ray should hit the triangle mesh");
 
         assert_eq!(hit.body, mesh);
         assert!((hit.distance - 3.0).abs() < 1e-4, "hit distance = {}", hit.distance);
         assert!(hit.point.y.abs() < 1e-4, "hit point = {:?}", hit.point);
         assert!(hit.normal.y > 0.9, "hit normal = {:?}", hit.normal);
+    }
+
+    #[test]
+    fn sweep_test_hits_sphere_along_path() {
+        let mut world = World::new();
+        let target = world.add_body(RigidBody::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            Vec3::new(5.0, 0.0, 0.0),
+            1.0,
+        ));
+
+        let hit = world
+            .sweep_test(
+                &Shape::Sphere { radius: 0.25 },
+                Vec3::ZERO,
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+            )
+            .expect("swept sphere should hit the target sphere");
+
+        // 两球表面接触时,中心距离 = 0.25 + 0.5,起点在 origin,故 distance = 5 - 0.75
+        assert_eq!(hit.body, target);
+        assert!((hit.distance - 4.25).abs() < 1e-4, "hit distance = {}", hit.distance);
+        assert!((hit.fraction - 0.425).abs() < 1e-4, "hit fraction = {}", hit.fraction);
+        assert!((hit.point.x - 4.5).abs() < 1e-4, "hit point = {:?}", hit.point);
+        assert!((hit.normal.x + 1.0).abs() < 1e-4, "hit normal = {:?}", hit.normal);
+    }
+
+    #[test]
+    fn sweep_test_returns_none_when_path_clear() {
+        let mut world = World::new();
+        world.add_body(RigidBody::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            Vec3::new(0.0, 5.0, 0.0),
+            1.0,
+        ));
+        world.add_body(RigidBody::new_static(
+            Shape::Box { half_extents: Vec3::new(0.5, 0.5, 0.5) },
+            Vec3::new(0.0, -5.0, 0.0),
+        ));
+
+        let hit = world.sweep_test(
+            &Shape::Sphere { radius: 0.25 },
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 0.0),
+            3.0,
+        );
+        assert!(hit.is_none(), "sweep along clear path should miss, got {hit:?}");
+    }
+
+    #[test]
+    fn sweep_test_against_box_and_plane() {
+        let mut world = World::new();
+        let plane = world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+        let wall = world.add_body(RigidBody::new_static(
+            Shape::Box { half_extents: Vec3::new(0.2, 1.0, 1.0) },
+            Vec3::new(0.0, 5.0, 0.0),
+        ));
+
+        // 竖直向下扫掠,命中平面:distance = 3 - 0.25
+        let down = world
+            .sweep_test(
+                &Shape::Sphere { radius: 0.25 },
+                Vec3::new(5.0, 3.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                10.0,
+            )
+            .expect("downward sweep should hit the plane");
+        assert_eq!(down.body, plane);
+        assert!((down.distance - 2.75).abs() < 1e-4, "down distance = {}", down.distance);
+        assert!(down.normal.y > 0.99, "down normal = {:?}", down.normal);
+
+        // 水平扫掠,命中 box 墙面:distance = 4 - 0.2 - 0.25
+        let sideways = world
+            .sweep_test(
+                &Shape::Sphere { radius: 0.25 },
+                Vec3::new(-4.0, 5.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0,
+            )
+            .expect("sideways sweep should hit the static box");
+        assert_eq!(sideways.body, wall);
+        assert!((sideways.distance - 3.55).abs() < 1e-4, "sideways distance = {}", sideways.distance);
+        assert!((sideways.normal.x + 1.0).abs() < 1e-4, "sideways normal = {:?}", sideways.normal);
+    }
+
+    #[test]
+    fn sweep_test_picks_earliest_hit_among_multiple_bodies() {
+        let mut world = World::new();
+        world.add_body(RigidBody::new_static(
+            Shape::Sphere { radius: 0.5 },
+            Vec3::new(8.0, 0.0, 0.0),
+        ));
+        let near = world.add_body(RigidBody::new_static(
+            Shape::Sphere { radius: 0.5 },
+            Vec3::new(3.0, 0.0, 0.0),
+        ));
+
+        let hit = world
+            .sweep_test(
+                &Shape::Sphere { radius: 0.5 },
+                Vec3::ZERO,
+                Vec3::new(1.0, 0.0, 0.0),
+                20.0,
+            )
+            .expect("sweep should hit something");
+        assert_eq!(hit.body, near, "should report the earliest hit along the path");
+        assert!((hit.distance - 2.0).abs() < 1e-4, "hit distance = {}", hit.distance);
+    }
+
+    #[test]
+    fn character_walks_and_stops_at_wall() {
+        let mut world = World::new();
+        world.gravity = Vec3::ZERO;
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+        world.add_body(RigidBody::new_static(
+            Shape::Box { half_extents: Vec3::new(0.2, 2.0, 2.0) },
+            Vec3::new(3.0, 2.0, 0.0),
+        ));
+
+        let mut controller = CharacterController::new(0.6, 0.3, Vec3::new(0.0, 1.0, 0.0));
+        controller.gravity = 0.0; // 只关心水平运动
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..240 {
+            controller.update(&world, dt, Vec3::new(3.0 * dt, 0.0, 0.0));
+        }
+
+        // 墙的内侧面在 x = 3 - 0.2 = 2.8,胶囊半径 0.3 + skin 0.02,中心最多到 ~2.48
+        assert!(controller.position.x < 2.55, "character should stop before the wall, x = {}", controller.position.x);
+        assert!(controller.position.x > 1.5, "character should have walked a visible distance, x = {}", controller.position.x);
+    }
+
+    #[test]
+    fn character_falls_and_lands_on_ground() {
+        let mut world = World::new();
+        world.gravity = Vec3::ZERO;
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+
+        let mut controller = CharacterController::new(0.6, 0.3, Vec3::new(0.0, 3.0, 0.0));
+        let dt = 1.0 / 60.0;
+        let mut state = controller.update(&world, dt, Vec3::ZERO);
+        for _ in 0..300 {
+            state = controller.update(&world, dt, Vec3::ZERO);
+        }
+
+        // 胶囊中心应停在 half_height + radius + skin ≈ 0.9 附近
+        assert!(state.on_ground, "character should end up grounded");
+        assert!((state.position.y - 0.92).abs() < 0.1, "resting y = {}", state.position.y);
+        assert!(controller.vertical_velocity.abs() < 1e-3, "vertical velocity should be zeroed on landing");
+    }
+
+    #[test]
+    fn character_steps_up_onto_low_ledge() {
+        let mut world = World::new();
+        world.gravity = Vec3::ZERO;
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+        // 矮台阶:高 0.2(低于 step_height 0.3),顶面 y=0.2
+        world.add_body(RigidBody::new_static(
+            Shape::Box { half_extents: Vec3::new(1.0, 0.1, 1.0) },
+            Vec3::new(3.0, 0.1, 0.0),
+        ));
+
+        let mut controller = CharacterController::new(0.6, 0.3, Vec3::new(0.0, 0.92, 0.0));
+        controller.gravity = 0.0;
+        controller.step_height = 0.3;
+
+        let dt = 1.0 / 60.0;
+        let mut stepped = false;
+        for _ in 0..240 {
+            let state = controller.update(&world, dt, Vec3::new(2.0 * dt, 0.0, 0.0));
+            if state.stepped_up {
+                stepped = true;
+            }
+        }
+
+        assert!(stepped, "controller should have stepped up onto the low ledge at least once");
+        assert!(controller.position.x > 2.5, "character should have crossed onto the ledge, x = {}", controller.position.x);
+    }
+
+    #[test]
+    fn character_slides_down_too_steep_slope() {
+        let mut world = World::new();
+        world.gravity = Vec3::ZERO;
+        // 60° 斜坡,超过默认 50° 上限
+        let slope_normal = Vec3::new(0.0, 60.0_f32.to_radians().cos(), 60.0_f32.to_radians().sin()).normalized();
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: slope_normal, offset: 0.0 },
+            Vec3::ZERO,
+        ));
+
+        let mut controller = CharacterController::new(0.6, 0.3, Vec3::new(0.0, 1.2, 0.0));
+        controller.max_slope_angle = 50.0_f32.to_radians();
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..120 {
+            controller.update(&world, dt, Vec3::ZERO);
+        }
+
+        assert!(controller.position.z.abs() > 0.05 || !controller.on_ground,
+            "character should slide down the too-steep slope instead of resting, z = {}, on_ground = {}",
+            controller.position.z, controller.on_ground);
+    }
+
+    #[test]
+    fn raycast_vehicle_holds_chassis_at_suspension_height() {
+        let mut world = World::new();
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+
+        let chassis = world.add_body(RigidBody::new_dynamic(
+            Shape::Box { half_extents: Vec3::new(0.8, 0.2, 0.4) },
+            Vec3::new(0.0, 0.85, 0.0),
+            800.0,
+        ));
+        world.bodies[chassis].restitution = 0.0;
+
+        let mut vehicle = RaycastVehicle::new(chassis);
+        let wheel_dir = Vec3::new(0.0, -1.0, 0.0);
+        let wheel_axle = Vec3::new(0.0, 0.0, 1.0);
+        for (x, z) in [(-0.7, -0.35), (-0.7, 0.35), (0.7, -0.35), (0.7, 0.35)] {
+            vehicle.add_wheel(Wheel::new(
+                Vec3::new(x, 0.0, z),
+                wheel_dir,
+                wheel_axle,
+                0.3,
+                0.6,
+            ));
+        }
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..600 {
+            vehicle.update(&mut world, dt);
+            world.step(dt);
+        }
+
+        let y = world.bodies[chassis].transform.position.y;
+        // 悬挂静止长度 0.6 + 轮半径 0.3 => 底盘中心应停在 ~0.9 附近(允许悬挂振荡余量)
+        assert!(y > 0.6 && y < 1.3, "chassis should settle at suspension height, y = {y}");
+        let vy = world.bodies[chassis].linear_velocity.y;
+        assert!(vy.abs() < 0.5, "chassis vertical velocity should be damped, vy = {vy}");
+        assert!(vehicle.wheels.iter().all(|w| w.on_ground), "all wheels should be on the ground");
+    }
+
+    #[test]
+    fn raycast_vehicle_engine_force_accelerates_chassis_forward() {
+        let mut world = World::new();
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+
+        // 底盘初始 y=0.85,在射线 max_len=0.9 范围内,能检测到地面
+        let chassis = world.add_body(RigidBody::new_dynamic(
+            Shape::Box { half_extents: Vec3::new(0.8, 0.2, 0.4) },
+            Vec3::new(0.0, 0.85, 0.0),
+            800.0,
+        ));
+        world.bodies[chassis].restitution = 0.0;
+
+        let mut vehicle = RaycastVehicle::new(chassis);
+        let wheel_dir = Vec3::new(0.0, -1.0, 0.0);
+        let wheel_axle = Vec3::new(0.0, 0.0, 1.0);
+        let mut wheel_indices = Vec::new();
+        for (x, z) in [(-0.7, -0.35), (-0.7, 0.35), (0.7, -0.35), (0.7, 0.35)] {
+            wheel_indices.push(vehicle.add_wheel(Wheel::new(
+                Vec3::new(x, 0.0, z),
+                wheel_dir,
+                wheel_axle,
+                0.3,
+                0.6,
+            )));
+        }
+
+        let dt = 1.0 / 60.0;
+        for idx in &wheel_indices {
+            vehicle.wheels[*idx].engine_force = 4000.0;
+        }
+        for _ in 0..180 {
+            vehicle.update(&mut world, dt);
+            world.step(dt);
+        }
+
+        let vx = world.bodies[chassis].linear_velocity.x;
+        let x = world.bodies[chassis].transform.position.x;
+        assert!(vx > 2.0, "engine force should accelerate the chassis forward, vx = {vx}");
+        assert!(x > 1.0, "chassis should have visibly moved forward, x = {x}");
+    }
+
+    #[test]
+    fn raycast_vehicle_lateral_grip_resists_sideways_slide() {
+        let mut world = World::new();
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+
+        // 底盘初始 y=0.85,在射线 max_len=0.9 范围内,确保车轮接地
+        let chassis = world.add_body(RigidBody::new_dynamic(
+            Shape::Box { half_extents: Vec3::new(0.8, 0.2, 0.4) },
+            Vec3::new(0.0, 0.85, 0.0),
+            800.0,
+        ));
+        world.bodies[chassis].restitution = 0.0;
+
+        let mut vehicle = RaycastVehicle::new(chassis);
+        let wheel_dir = Vec3::new(0.0, -1.0, 0.0);
+        let wheel_axle = Vec3::new(0.0, 0.0, 1.0);
+        for (x, z) in [(-0.7, -0.35), (-0.7, 0.35), (0.7, -0.35), (0.7, 0.35)] {
+            vehicle.add_wheel(Wheel::new(
+                Vec3::new(x, 0.0, z),
+                wheel_dir,
+                wheel_axle,
+                0.3,
+                0.6,
+            ));
+        }
+
+        let dt = 1.0 / 60.0;
+        // 先跑 20 帧让悬挂稳定,再给侧向速度让 grip 生效
+        for _ in 0..20 {
+            vehicle.update(&mut world, dt);
+            world.step(dt);
+        }
+        world.bodies[chassis].linear_velocity = Vec3::new(0.0, 0.0, 3.0);
+        for _ in 0..120 {
+            vehicle.update(&mut world, dt);
+            world.step(dt);
+        }
+
+        let vz = world.bodies[chassis].linear_velocity.z;
+        assert!(vz.abs() < 0.5, "lateral grip should damp most of the sideways velocity, vz = {vz}");
+    }
+
+    #[test]
+    fn softbody_chain_falls_under_gravity() {
+        use crate::softbody::SoftBody;
+
+        let mut body = SoftBody::new();
+        // 5 质点链条,垂直排列,间距 0.5
+        let p0 = body.add_particle(Vec3::new(0.0, 2.0, 0.0), 0.0); // 固定
+        let p1 = body.add_particle(Vec3::new(0.0, 1.5, 0.0), 1.0);
+        let p2 = body.add_particle(Vec3::new(0.0, 1.0, 0.0), 1.0);
+        let p3 = body.add_particle(Vec3::new(0.0, 0.5, 0.0), 1.0);
+        let p4 = body.add_particle(Vec3::new(0.0, 0.0, 0.0), 1.0);
+        body.add_spring(p0, p1, 100.0);
+        body.add_spring(p1, p2, 100.0);
+        body.add_spring(p2, p3, 100.0);
+        body.add_spring(p3, p4, 100.0);
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..120 {
+            body.step(Vec3::new(0.0, -9.81, 0.0), dt, 4);
+        }
+
+        // 仅验证质点未爆炸(NaN/Inf)且运动合理
+        for i in 0..body.particle_count {
+            let p = body.positions[i];
+            assert!(p.x.is_finite() && p.y.is_finite(), "particle {i} NaN/Inf");
+        }
+        // 最底端质点应低于起点
+        assert!(body.positions[p4].y < 0.3, "bottom particle should have fallen, y={}", body.positions[p4].y);
+        // 固定点应不动
+        assert!((body.positions[p0].y - 2.0).abs() < 1e-4, "fixed particle moved");
+    }
+
+    #[test]
+    fn softbody_spring_restores_rest_length() {
+        use crate::softbody::SoftBody;
+
+        let mut body = SoftBody::new();
+        let a = body.add_particle(Vec3::new(0.0, 0.0, 0.0), 1.0);
+        let b = body.add_particle(Vec3::new(1.5, 0.0, 0.0), 1.0);
+        body.add_spring(a, b, 50.0); // rest_length = 1.5 (当前距离)
+
+        let dt = 1.0 / 60.0;
+        // 手动拉长后,弹簧应回缩
+        body.positions[b] = Vec3::new(3.0, 0.0, 0.0);
+        for _ in 0..60 {
+            body.step(Vec3::ZERO, dt, 8);
+        }
+
+        let dist = (body.positions[a] - body.positions[b]).length();
+        assert!((dist - 1.5).abs() < 0.15, "spring should return near rest length, dist={dist}");
+    }
+
+    #[test]
+    fn softbody_fixed_particle_unmoved_by_springs() {
+        use crate::softbody::SoftBody;
+
+        let mut body = SoftBody::new();
+        let anchor = body.add_particle(Vec3::new(0.0, 1.0, 0.0), 0.0); // 固定
+        let hang = body.add_particle(Vec3::new(0.0, 0.0, 0.0), 1.0);
+        body.add_spring(anchor, hang, 100.0);
+
+        let dt = 1.0 / 60.0;
+        let original = body.positions[anchor];
+        for _ in 0..30 {
+            body.step(Vec3::new(0.0, -9.81, 0.0), dt, 4);
+        }
+        assert!((body.positions[anchor].y - original.y).abs() < 1e-6,
+            "fixed particle should never move");
+    }
+
+    #[test]
+    fn softbody_no_nan_with_zero_mass_particles() {
+        use crate::softbody::SoftBody;
+
+        let mut body = SoftBody::new();
+        let a = body.add_particle(Vec3::ZERO, 0.0);
+        let b = body.add_particle(Vec3::new(1.0, 0.0, 0.0), 0.0);
+        body.add_spring(a, b, 100.0);
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..10 {
+            body.step(Vec3::new(0.0, -9.81, 0.0), dt, 4);
+        }
+        for i in 0..body.particle_count {
+            let p = body.positions[i];
+            assert!(p.x.is_finite() && p.y.is_finite(), "particle {i} NaN with zero mass");
+        }
+    }
+
+    #[test]
+    fn softbody_pinned_follows_rigid_body() {
+        use crate::softbody::SoftBody;
+
+        let mut world = World::new();
+        // 一个会移动的刚体
+        world.add_body(RigidBody::new_static(
+            Shape::Sphere { radius: 1.0 },
+            Vec3::new(2.0, 2.0, 0.0),
+        ));
+        let mover = world.add_body(RigidBody::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            Vec3::new(0.0, 0.0, 0.0),
+            1.0,
+        ));
+        world.bodies[mover].linear_velocity = Vec3::new(5.0, 0.0, 0.0);
+
+        let mut body = SoftBody::new();
+        let pin = body.add_particle(Vec3::new(0.0, 0.5, 0.0), 1.0);
+        let free = body.add_particle(Vec3::new(0.0, -0.5, 0.0), 1.0);
+        body.add_spring(pin, free, 100.0);
+        body.pin_to_body(pin, mover, Vec3::new(0.0, 0.5, 0.0));
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..30 {
+            body.step_coupled(&world, Vec3::ZERO, dt, 4, 0.05);
+            world.step(dt);
+        }
+
+        // 附着质点跟随刚体运动
+        assert!(body.positions[pin].x > 1.0, "pinned particle should follow body, x={}", body.positions[pin].x);
+        // 自由质点也被弹簧拉走
+        assert!(body.positions[free].x > 0.5, "free particle should be pulled, x={}", body.positions[free].x);
+    }
+
+    #[test]
+    fn softbody_particles_bounce_off_static_box() {
+        use crate::softbody::SoftBody;
+
+        let mut world = World::new();
+        // 地面
+        world.add_body(RigidBody::new_static(
+            Shape::Plane { normal: Vec3::new(0.0, 1.0, 0.0), offset: 0.0 },
+            Vec3::ZERO,
+        ));
+
+        let mut body = SoftBody::new();
+        // 仅一个自由质点从高处掉落
+        let p = body.add_particle(Vec3::new(0.0, 2.0, 0.0), 1.0);
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..120 {
+            body.step_coupled(&world, Vec3::new(0.0, -9.81, 0.0), dt, 4, 0.2);
+        }
+
+        // 半径 0.2,不应穿透 y=0 平面
+        assert!(body.positions[p].y >= 0.15, "particle should rest above plane, y={}", body.positions[p].y);
+    }
+
+    #[test]
+    fn softbody_particles_bounce_off_static_sphere() {
+        use crate::softbody::SoftBody;
+
+        let mut world = World::new();
+        world.gravity = Vec3::ZERO;
+        world.add_body(RigidBody::new_static(
+            Shape::Sphere { radius: 0.5 },
+            Vec3::new(0.0, 1.0, 0.0),
+        ));
+
+        let mut body = SoftBody::new();
+        let p = body.add_particle(Vec3::new(0.0, 2.5, 0.0), 1.0);
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..60 {
+            body.step_coupled(&world, Vec3::new(0.0, -9.81, 0.0), dt, 4, 0.2);
+        }
+
+        // 粒子半径 0.2 + 球半径 0.5 = 0.7, 球心 y=1.0, 粒子最低 y=1.7
+        assert!(body.positions[p].y > 1.65, "particle should rest on sphere, y={}", body.positions[p].y);
+    }
+
+    #[test]
+    fn softbody_pinned_unpin_frees_particle() {
+        use crate::softbody::SoftBody;
+
+        let mut world = World::new();
+        let box_body = world.add_body(RigidBody::new_static(
+            Shape::Box { half_extents: Vec3::new(0.5, 0.5, 0.5) },
+            Vec3::new(0.0, 0.5, 0.0),
+        ));
+
+        let mut body = SoftBody::new();
+        let pin = body.add_particle(Vec3::new(0.0, 1.8, 0.0), 1.0);  // 盒子顶上方
+        let hang = body.add_particle(Vec3::new(0.0, 1.2, 0.0), 1.0);
+        body.add_spring(pin, hang, 100.0);
+        // 附着到 box 上方 offset: (0, 0.8, 0) → world (0, 0.5+0.8, 0) = (0, 1.3, 0)
+        body.pin_to_body(pin, box_body, Vec3::new(0.0, 0.8, 0.0));
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..10 {
+            body.step_coupled(&world, Vec3::ZERO, dt, 4, 0.05);
+            world.step(dt);
+        }
+        let pinned_y = body.positions[pin].y;
+        assert!((pinned_y - 1.3).abs() < 0.1, "pin should be at box top+offset, y={pinned_y}");
+
+        // 解除附着
+        body.unpin(pin);
+        // 给重力,看 pin 是否不再固定在原位置
+        for _ in 0..30 {
+            body.step_coupled(&world, Vec3::new(0.0, -9.81, 0.0), dt, 4, 0.05);
+            world.step(dt);
+        }
+        // 解绑后 pin 应因重力/弹簧移动,不再是原来的固定位置
+        assert!((body.positions[pin].y - pinned_y).abs() > 0.05,
+            "unpinned particle should move from pinned position, y={}", body.positions[pin].y);
+        // 但不应穿透盒子(粒子半径 0.05 + 盒顶 y=1.0,最低 ~1.05)
+        assert!(body.positions[pin].y > 1.0, "unpinned particle should stay above box, y={}", body.positions[pin].y);
+    }
+
+    #[test]
+    fn softbody_cloth_grid_hangs_under_gravity() {
+        use crate::softbody::SoftBody;
+
+        let mut world = World::new();
+        let mut body = SoftBody::new();
+        // 5x5 网格
+        let indices = body.add_cloth_grid(
+            5, 5, Vec3::new(0.0, 2.0, 0.0), 0.3,
+            2.0,
+            200.0, 50.0, 20.0,
+        );
+        // 固定左上两角
+        body.inv_masses[indices[0]] = 0.0;
+        body.inv_masses[indices[4]] = 0.0;
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..180 {
+            body.step_coupled(&world, Vec3::new(0.0, -9.81, 0.0), dt, 4, 0.02);
+            world.step(dt);
+        }
+
+        for p in &body.positions {
+            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        }
+        // 底部粒子应下垂
+        let bottom = indices[4 * 5 + 0];
+        assert!(body.positions[bottom].y < 1.6, "cloth should drape, y={}", body.positions[bottom].y);
+        // 验证三种弹簧都存在
+        let structural = body.springs.iter().filter(|s| s.kind == crate::softbody::SpringKind::Structural).count();
+        let shear = body.springs.iter().filter(|s| s.kind == crate::softbody::SpringKind::Shear).count();
+        let bend = body.springs.iter().filter(|s| s.kind == crate::softbody::SpringKind::Bend).count();
+        assert!(structural > 10, "structural springs missing");
+        assert!(shear > 10, "shear springs missing");
+        assert!(bend > 10, "bend springs missing");
+    }
+
+    #[test]
+    fn softbody_wind_pushes_cloth() {
+        use crate::softbody::SoftBody;
+
+        let mut world = World::new();
+        let mut body = SoftBody::new();
+        // 手动构建竖直(在 xy 平面)3x3 网格
+        let mut indices = Vec::new();
+        for row in 0..3 {
+            for col in 0..3 {
+                let pos = Vec3::new(col as f32 * 0.5, 2.0 - row as f32 * 0.5, 0.0);
+                indices.push(body.add_particle(pos, 1.0 / 9.0));
+            }
+        }
+        for row in 0..3 {
+            for col in 0..3 {
+                let idx = row * 3 + col;
+                if col + 1 < 3 { body.add_spring(indices[idx], indices[idx+1], 200.0); }
+                if row + 1 < 3 { body.add_spring(indices[idx], indices[idx+3], 200.0); }
+                if row + 1 < 3 && col + 1 < 3 { body.add_spring(indices[idx], indices[idx+4], 50.0); }
+                if row + 1 < 3 && col >= 1 { body.add_spring(indices[idx], indices[idx+2], 50.0); }
+                if col + 2 < 3 { body.add_spring(indices[idx], indices[idx+2], 20.0); }
+                if row + 2 < 3 { body.add_spring(indices[idx], indices[idx+6], 20.0); }
+            }
+        }
+        for r in 0..2 {
+            for c in 0..2 {
+                let a = indices[r * 3 + c];
+                let b = indices[r * 3 + c + 1];
+                let d = indices[(r+1) * 3 + c];
+                let e = indices[(r+1) * 3 + c + 1];
+                body.triangles.push(crate::softbody::Triangle { a, b, c: d });
+                body.triangles.push(crate::softbody::Triangle { a: b, b: e, c: d });
+            }
+        }
+        // 固定四角
+        body.inv_masses[indices[0]] = 0.0;
+        body.inv_masses[indices[2]] = 0.0;
+        body.inv_masses[indices[6]] = 0.0;
+        body.inv_masses[indices[8]] = 0.0;
+
+        let dt = 1.0 / 60.0;
+        for _ in 0..60 {
+            body.step_coupled(&world, Vec3::new(0.0, -9.81, 0.0), dt, 4, 0.02);
+            world.step(dt);
+        }
+        let z_before = body.positions[indices[4]].z;
+
+        // 吹 z+ 方向的风,法线有 z 分量
+        let wind = Vec3::new(0.0, 0.0, 20.0);
+        body.apply_wind(wind, 1.2, 1.0);
+        for _ in 0..60 {
+            body.step_coupled(&world, Vec3::new(0.0, -9.81, 0.0), dt, 4, 0.02);
+            body.apply_wind(wind, 1.2, 1.0);
+            world.step(dt);
+        }
+
+        let z_after = body.positions[indices[4]].z;
+        assert!(z_after > z_before + 0.05,
+            "wind should push cloth, z_before={z_before}, z_after={z_after}");
     }
 
 }

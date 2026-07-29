@@ -87,7 +87,7 @@ impl World {
         }
     }
 
-    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RaycastHit> {
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32, skip_body: Option<usize>) -> Option<RaycastHit> {
         if max_dist <= 0.0 || dir.length_sq() <= 1e-12 {
             return None;
         }
@@ -95,7 +95,33 @@ impl World {
         let dir = dir.normalized();
         let mut best: Option<RaycastHit> = None;
         for (body, rigid_body) in self.bodies.iter().enumerate() {
+            if Some(body) == skip_body {
+                continue;
+            }
             let hit = ray_shape(origin, dir, max_dist, body, &rigid_body.shape, rigid_body.transform);
+            if let Some(hit) = hit {
+                let replace = best.as_ref().map(|best_hit| hit.distance < best_hit.distance).unwrap_or(true);
+                if replace {
+                    best = Some(hit);
+                }
+            }
+        }
+        best
+    }
+
+    /// 形状扫掠测试:让 `shape` 从 `from` 出发沿 `dir` 平移 `max_dist`,
+    /// 返回最早接触。Sphere 走精确解;其余形状用包围球近似(与 CCD 一致),
+    /// 因此结果是保守的(可能略早报触,不会穿透目标)。
+    pub fn sweep_test(&self, shape: &Shape, from: Vec3, dir: Vec3, max_dist: f32) -> Option<SweepHit> {
+        if max_dist <= 0.0 || dir.length_sq() <= 1e-12 {
+            return None;
+        }
+        let radius = sweep_shape_radius(shape)?;
+        let dir = dir.normalized();
+
+        let mut best: Option<SweepHit> = None;
+        for (body, rigid_body) in self.bodies.iter().enumerate() {
+            let hit = sweep_against_body(from, dir, max_dist, radius, body, &rigid_body.shape, rigid_body.transform);
             if let Some(hit) = hit {
                 let replace = best.as_ref().map(|best_hit| hit.distance < best_hit.distance).unwrap_or(true);
                 if replace {
@@ -169,6 +195,104 @@ fn shape_ccd_radius(shape: &Shape) -> Option<f32> {
         Shape::Box { half_extents } => Some(half_extents.length()),
         _ => None,
     }
+}
+
+/// sweep_test 里扫掠形状取多大半径:Sphere 精确,Box/Capsule/凸包/Compound
+/// 退化为包围球,Plane/TriangleMesh 不能作为扫掠形状。
+fn sweep_shape_radius(shape: &Shape) -> Option<f32> {
+    match *shape {
+        Shape::Sphere { radius } => Some(radius),
+        Shape::Box { half_extents } => Some(half_extents.length()),
+        Shape::Capsule { half_height, radius } => Some(half_height + radius),
+        Shape::ConvexHull { .. } | Shape::Compound { .. } => {
+            let half = shape.local_aabb_half_extents();
+            Some(half.length())
+        }
+        Shape::Plane { .. } | Shape::TriangleMesh { .. } => None,
+    }
+}
+
+fn sweep_against_body(
+    start: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    radius: f32,
+    body: usize,
+    shape: &Shape,
+    transform: Transform,
+) -> Option<SweepHit> {
+    match *shape {
+        Shape::Sphere { radius: target_radius } => {
+            sweep_sphere_sphere(start, dir, max_dist, radius, body, transform.position, target_radius)
+        }
+        Shape::Plane { normal, offset } => {
+            let (toi, normal) = sweep_sphere_plane(start, dir, max_dist, radius, normal, offset)?;
+            Some(make_sweep_hit(body, start, dir, max_dist, radius, toi, normal))
+        }
+        Shape::Box { half_extents } => {
+            let (toi, normal) = sweep_sphere_box(start, dir, max_dist, radius, transform, half_extents)?;
+            Some(make_sweep_hit(body, start, dir, max_dist, radius, toi, normal))
+        }
+        Shape::TriangleMesh { triangles } => {
+            let (toi, normal) = sweep_sphere_triangle_mesh(start, dir, max_dist, radius, triangles, transform)?;
+            Some(make_sweep_hit(body, start, dir, max_dist, radius, toi, normal))
+        }
+        Shape::Capsule { half_height, radius: capsule_radius } => {
+            // 保守近似:用胶囊的包围球
+            sweep_sphere_sphere(start, dir, max_dist, radius, body, transform.position, half_height + capsule_radius)
+        }
+        Shape::Compound { children } => {
+            let mut best: Option<SweepHit> = None;
+            for child in children {
+                let child_transform = compose_transform(transform, child.transform);
+                if let Some(hit) = sweep_against_body(start, dir, max_dist, radius, body, &child.shape, child_transform) {
+                    let replace = best.as_ref().map(|best_hit| hit.distance < best_hit.distance).unwrap_or(true);
+                    if replace {
+                        best = Some(hit);
+                    }
+                }
+            }
+            best
+        }
+        Shape::ConvexHull { .. } => {
+            // 保守近似:用凸包的包围球(以刚体质心为中心)
+            sweep_sphere_sphere(start, dir, max_dist, radius, body, transform.position, shape.local_aabb_half_extents().length())
+        }
+    }
+}
+
+fn make_sweep_hit(body: usize, start: Vec3, dir: Vec3, max_dist: f32, radius: f32, toi: f32, normal: Vec3) -> SweepHit {
+    let distance = toi * max_dist;
+    let center = start + dir.scale(distance);
+    SweepHit {
+        body,
+        point: center - normal.scale(radius),
+        normal,
+        distance,
+        fraction: toi,
+    }
+}
+
+/// 球-球扫掠:退化成"点射线 vs 半径相加的球"的解析解。
+fn sweep_sphere_sphere(
+    start: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    radius: f32,
+    body: usize,
+    center: Vec3,
+    target_radius: f32,
+) -> Option<SweepHit> {
+    let combined = radius + target_radius;
+    let hit = ray_sphere(start, dir, max_dist, body, center, combined)?;
+    let center_at_hit = start + dir.scale(hit.distance);
+    Some(SweepHit {
+        body,
+        point: center_at_hit - hit.normal.scale(radius),
+        normal: hit.normal,
+        distance: hit.distance,
+        fraction: hit.distance / max_dist.max(1e-6),
+    })
 }
 
 fn sweep_shape_against_static(
